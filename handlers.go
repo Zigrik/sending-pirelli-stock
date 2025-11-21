@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -99,13 +100,16 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Сбрасываем позицию чтения файла на начало
+	file.Seek(0, 0)
+
 	// Проверяем содержимое файла на безопасность
 	if err := validateCSVFile(file); err != nil {
 		http.Error(w, "Файл содержит потенциально опасное содержимое: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Сбрасываем позицию чтения файла
+	// Снова сбрасываем позицию чтения для сохранения
 	file.Seek(0, 0)
 
 	// Сохраняем файл временно
@@ -124,7 +128,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Отправляем файл в PIRELLI
-	response, err := uploadFileToPirelli(tempFile.Name(), header.Filename)
+	filename := generatePirelliFilename()
+	response, err := uploadFileToPirelli(tempFile.Name(), filename)
+
 	if err != nil {
 		http.Error(w, "Ошибка отправки в PIRELLI: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -141,12 +147,15 @@ func handleWebUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Println("Начало обработки загрузки файла через веб-форму")
+
 	// Ограничиваем размер файла (10MB)
 	r.ParseMultipartForm(10 << 20)
 
 	// Проверяем пароль
 	password := r.FormValue("password")
 	if password != config.AdminPassword {
+		log.Println("Неверный пароль")
 		sendWebResult(w, false, "Неверный пароль")
 		return
 	}
@@ -154,29 +163,38 @@ func handleWebUpload(w http.ResponseWriter, r *http.Request) {
 	// Получаем файл из формы
 	file, header, err := r.FormFile("file")
 	if err != nil {
+		log.Printf("Ошибка чтения файла: %v", err)
 		sendWebResult(w, false, "Ошибка чтения файла: "+err.Error())
 		return
 	}
 	defer file.Close()
 
+	log.Printf("Получен файл: %s, размер: %d", header.Filename, header.Size)
+
 	// Проверяем расширение файла
 	if !strings.HasSuffix(strings.ToLower(header.Filename), ".csv") {
+		log.Println("Неверное расширение файла")
 		sendWebResult(w, false, "Можно загружать только CSV файлы")
 		return
 	}
 
+	// Сбрасываем позицию чтения файла на начало
+	file.Seek(0, 0)
+
 	// Проверяем содержимое файла на безопасность
 	if err := validateCSVFile(file); err != nil {
-		sendWebResult(w, false, "Файл содержит потенциально опасное содержимое: "+err.Error())
+		log.Printf("Файл не прошел проверку безопасности: %v", err)
+		sendWebResult(w, false, "Файл не прошел проверку безопасности: "+err.Error())
 		return
 	}
 
-	// Сбрасываем позицию чтения файла
+	// Снова сбрасываем позицию чтения для сохранения
 	file.Seek(0, 0)
 
-	// Сохраняем файл временно
+	// Создаем временный файл для отправки
 	tempFile, err := os.CreateTemp("", "web-upload-*.csv")
 	if err != nil {
+		log.Printf("Ошибка создания временного файла: %v", err)
 		sendWebResult(w, false, "Ошибка создания временного файла")
 		return
 	}
@@ -185,16 +203,24 @@ func handleWebUpload(w http.ResponseWriter, r *http.Request) {
 
 	_, err = io.Copy(tempFile, file)
 	if err != nil {
+		log.Printf("Ошибка сохранения файла: %v", err)
 		sendWebResult(w, false, "Ошибка сохранения файла")
 		return
 	}
 
+	log.Printf("Временный файл создан: %s", tempFile.Name())
+
 	// Отправляем файл в PIRELLI
-	response, err := uploadFileToPirelli(tempFile.Name(), header.Filename)
+	log.Println("Начало отправки файла в PIRELLI")
+	filename := generatePirelliFilename()
+	response, err := uploadFileToPirelli(tempFile.Name(), filename)
 	if err != nil {
+		log.Printf("Ошибка отправки в PIRELLI: %v", err)
 		sendWebResult(w, false, "Ошибка отправки в PIRELLI: "+err.Error())
 		return
 	}
+
+	log.Printf("Ответ от PIRELLI: статус=%t, код=%d, сообщение=%s", response.Status, response.Code, response.Message)
 
 	// Формируем детали ответа
 	details := ""

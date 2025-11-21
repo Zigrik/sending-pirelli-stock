@@ -2,13 +2,13 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,60 +52,98 @@ func sendWebResult(w http.ResponseWriter, success bool, message string, details 
 	json.NewEncoder(w).Encode(result)
 }
 
-// validateCSVFile проверяет CSV файл на безопасность
+// validateCSVFile с логированием для отладки
 func validateCSVFile(file io.Reader) error {
-	// Создаем CSV reader
-	reader := csv.NewReader(file)
-	reader.Comma = ';' // или ',' в зависимости от формата
-	reader.LazyQuotes = true
-
-	// Читаем и проверяем первые несколько строк
-	for i := 0; i < 100; i++ {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("ошибка чтения CSV: %v", err)
-		}
-
-		// Проверяем каждое поле в записи
-		for _, field := range record {
-			if containsMaliciousContent(field) {
-				return fmt.Errorf("обнаружено потенциально опасное содержимое")
-			}
-
-			if len(field) > 10000 {
-				return fmt.Errorf("поле слишком длинное")
-			}
-		}
-
-		if len(record) > 100 {
-			return fmt.Errorf("слишком много колонок в CSV")
-		}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("ошибка чтения файла: %v", err)
 	}
 
+	log.Printf("Размер файла: %d байт", len(content))
+
+	// Проверяем размер (10MB максимум)
+	if len(content) > 10*1024*1024 {
+		return fmt.Errorf("файл слишком большой (максимум 10MB)")
+	}
+
+	// Проверяем что не пустой
+	if len(content) == 0 {
+		return fmt.Errorf("файл пустой")
+	}
+
+	// Логируем первые 100 символов для отладки
+	if len(content) > 100 {
+		log.Printf("Первые 100 символов файла: %s", string(content[:100]))
+	} else {
+		log.Printf("Содержимое файла: %s", string(content))
+	}
+
+	// Проверяем на вредоносный код
+	if containsMaliciousContent(string(content)) {
+		return fmt.Errorf("обнаружено потенциально опасное содержимое")
+	}
+
+	log.Printf("Файл прошел проверку безопасности")
 	return nil
 }
 
-// containsMaliciousContent проверяет строку на наличие потенциально опасного содержимого
+// validateCSVFileFromPath проверяет CSV файл по пути
+func validateCSVFileFromPath(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл: %v", err)
+	}
+	defer file.Close()
+
+	return validateCSVFile(file)
+}
+
+// containsMaliciousContent проверяет на опасный код для Linux
 func containsMaliciousContent(s string) bool {
 	lower := strings.ToLower(s)
 
+	// Опасные паттерны для Linux сервера
 	dangerousPatterns := []string{
-		"<script", "javascript:", "vbscript:", "onload=", "onerror=", "onclick=",
-		"eval(", "exec(", "union select", "drop table", "insert into", "<iframe",
-		"<object", "<embed", "\\x00", "../",
+		// Shell injection
+		"$((", "`", "&&", "||", "|", ">", "<", ";",
+		// Command execution
+		"/bin/bash", "/bin/sh", "bash -c", "sh -c", "eval ", "exec(",
+		// System commands
+		"rm -rf", "rm -f", "chmod", "chown", "sudo", "su ",
+		"wget", "curl", "nc ", "netcat", "ssh ", "scp ",
+		// File system access
+		"/etc/passwd", "/etc/shadow", "/etc/hosts", "/proc/",
+		"../../", "../etc/", "/root/", "/home/",
+		// Network
+		"127.0.0.1", "localhost", "0.0.0.0",
+		// Code injection
+		"<script", "javascript:", "vbscript:", "onload=", "onerror=",
+		"<iframe", "<object", "<embed",
+		// SQL injection (базовые)
+		"union select", "drop table", "insert into", "delete from",
+		"update set", "create table", "alter table",
+		// PHP injection
+		"<?php", "<?=", "system(", "shell_exec(", "exec(",
+		"passthru(", "proc_open", "popen(",
 	}
 
 	for _, pattern := range dangerousPatterns {
 		if strings.Contains(lower, pattern) {
+			log.Printf("Обнаружен опасный паттерн: %s", pattern)
 			return true
 		}
 	}
 
-	if len(s) > 1000 && strings.Count(s, s[0:1]) > len(s)*9/10 {
-		return true
+	// Проверка на бинарные файлы (первые байты)
+	if len(s) > 4 {
+		// ELF binary
+		if s[0] == 0x7f && s[1] == 'E' && s[2] == 'L' && s[3] == 'F' {
+			return true
+		}
+		// PE executable (Windows)
+		if s[0] == 'M' && s[1] == 'Z' {
+			return true
+		}
 	}
 
 	return false
@@ -113,6 +151,11 @@ func containsMaliciousContent(s string) bool {
 
 // uploadFile отправляет файл в PIRELLI (для автоматической отправки)
 func uploadFile(filePath string) error {
+	// Сначала проверяем файл
+	if err := validateCSVFileFromPath(filePath); err != nil {
+		return fmt.Errorf("ошибка проверки файла: %v", err)
+	}
+
 	response, err := uploadFileToPirelli(filePath, filepath.Base(filePath))
 	if err != nil {
 		return err
@@ -135,47 +178,96 @@ func uploadFileToPirelli(filePath, fileName string) (*PirelliResponse, error) {
 	}
 	defer file.Close()
 
+	// Создаем буфер для multipart формы
 	var requestBody bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
 
-	_ = writer.WriteField("action", "upload")
-	_ = writer.WriteField("auth_login", config.AuthLogin)
-	_ = writer.WriteField("auth_token", config.AuthToken)
+	// Устанавливаем ТОЧНЫЙ boundary как в 1С
+	boundary := "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+	writer.SetBoundary(boundary)
 
-	part, err := writer.CreateFormFile("file", fileName)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось создать форму для файла: %v", err)
+	// Добавляем поля формы в ТОЧНОМ порядке как в примере
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"action", "upload"},
+		{"auth_login", config.AuthLogin},
+		{"auth_token", config.AuthToken},
 	}
 
+	for _, field := range fields {
+		err = writer.WriteField(field.name, field.value)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка добавления %s: %v", field.name, err)
+		}
+	}
+
+	// Создаем заголовок для файла с правильным Content-Type
+	headers := make(textproto.MIMEHeader)
+	headers.Set("Content-Disposition",
+		fmt.Sprintf(`form-data; name="file"; filename="%s"`, fileName))
+	headers.Set("Content-Type", "text/csv")
+
+	// Создаем часть для файла
+	part, err := writer.CreatePart(headers)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось создать часть для файла: %v", err)
+	}
+
+	// Копируем содержимое файла
 	_, err = io.Copy(part, file)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось скопировать содержимое файла: %v", err)
 	}
 
+	// Закрываем writer для завершения формы
 	err = writer.Close()
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при закрытии writer: %v", err)
 	}
 
+	// Логируем первые 500 байт тела для отладки
+	bodyPreview := requestBody.Bytes()
+	previewLen := min(500, len(bodyPreview))
+	log.Printf("Размер тела запроса: %d байт", len(bodyPreview))
+	log.Printf("Первые %d байт тела: %s", previewLen, string(bodyPreview[:previewLen]))
+
+	// Создаем HTTP запрос
 	req, err := http.NewRequest("POST", config.BaseURL, &requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка создания запроса: %v", err)
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// Устанавливаем Content-Type с boundary
+	contentType := writer.FormDataContentType()
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Выполняем запрос
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	log.Printf("Выполняем запрос к %s", config.BaseURL)
+	log.Printf("Content-Type: %s", contentType)
+	log.Printf("Имя файла: %s", fileName)
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при выполнении запроса: %v", err)
 	}
 	defer resp.Body.Close()
 
+	// Читаем ответ
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения ответа: %v", err)
 	}
 
+	log.Printf("Ответ от PIRELLI: статус %d, тело: %s", resp.StatusCode, string(body))
+
+	// Парсим JSON ответ
 	var response PirelliResponse
 	err = json.Unmarshal(body, &response)
 	if err != nil {
@@ -183,6 +275,12 @@ func uploadFileToPirelli(filePath, fileName string) (*PirelliResponse, error) {
 	}
 
 	return &response, nil
+}
+
+// generatePirelliFilename генерирует имя файла по формату PIRELLI
+func generatePirelliFilename() string {
+	now := time.Now()
+	return fmt.Sprintf("ir_%s_%s.csv", config.AuthLogin, now.Format("20060102_150405"))
 }
 
 // embeddedFormTemplate возвращает встроенный HTML шаблон на случай отсутствия файла

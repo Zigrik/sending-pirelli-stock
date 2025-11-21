@@ -34,6 +34,18 @@ func main() {
 		log.Println("Продолжаем с настройками по умолчанию")
 	}
 
+	// Проверяем данные аутентификации
+	log.Printf("Проверка конфигурации:")
+	log.Printf("Company: %s", config.CompanyName)
+	log.Printf("Login: %s", config.AuthLogin)
+	log.Printf("Token: %s", config.AuthToken)
+	log.Printf("BaseURL: %s", config.BaseURL)
+
+	// Проверим длину токена (должен быть 64 символа для SHA256)
+	if len(config.AuthToken) != 64 {
+		log.Printf("ВНИМАНИЕ: Длина токена %d, ожидается 64 символа", len(config.AuthToken))
+	}
+
 	// Запускаем планировщик автоматической отправки
 	if config.UploadTime != "" && config.UploadDay >= 0 && config.UploadDay <= 6 {
 		go startScheduler()
