@@ -12,12 +12,7 @@ go build -o report-server
 Версия: 1.0.0
 Лицензия: MIT
 
-## Дополнительно: файл .env.example
-
-Создайте также файл `.env.example` для примеров конфигурации:
-
-**.env.example**:
-```env
+##```env
 # Конфигурация сервера
 SERVER_PORT=8080
 ADMIN_PASSWORD=change_this_password
