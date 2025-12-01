@@ -12,7 +12,7 @@ go build -o report-server
 Версия: 1.0.0
 Лицензия: MIT
 
-##```env
+## файл .env
 # Конфигурация сервера
 SERVER_PORT=8080
 ADMIN_PASSWORD=change_this_password
